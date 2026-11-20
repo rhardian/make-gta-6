@@ -1,5 +1,6 @@
 [
-  { "name": "1-start.jpg", "query": "?shot=start&seed=1" },
-  { "name": "2-play.jpg", "query": "?shot=play&seed=1" },
-  { "name": "3-end.jpg", "query": "?shot=end&seed=1" }
+  { "name": "1-cover-chase.jpg", "query": "?shot=chase&seed=1" },
+  { "name": "2-heist-shootout.jpg", "query": "?shot=heist&seed=2" },
+  { "name": "3-harbor-onfoot.jpg", "query": "?shot=harbor&seed=3" },
+  { "name": "4-sunset-city-map.jpg", "query": "?shot=overview&seed=4" }
 ]

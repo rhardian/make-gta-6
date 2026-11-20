@@ -1,124 +1,232 @@
-// The game's rules and state, with no drawing and no browser in it: the player's paddle, the
-// pool of falling blocks and coins, spawning, collisions, score, lives and level. step() advances
-// one fixed step and returns what happened as bit flags, so the caller can react without the
-// world knowing about screens or sound. Nothing here allocates after createWorld returns.
-import { BLOCK, COIN, FIELD, LEVEL, LIVES, PLAYER, POOL_SIZE } from './config.js';
+// Top-level open-world simulation state and fixed-step update loop for Solaris Bay: Heatwave.
+// Coordinates city collision, Elena Vega on-foot & driving controls, traffic AI, pedestrians,
+// 5-star police pursuit, ballistic combat, multi-stage story missions, and 3D chase camera.
 
-export const KIND_BLOCK = 0;
-export const KIND_COIN = 1;
+import { createAudioEngine } from './audio.js';
+import { createCamera3D, screenToWorldGround, updateCameraFollow } from './camera.js';
+import { collideWorldBuildings, createCityMap, findLandmarkByKind } from './city.js';
+import { createCombatSystem, fireEquippedWeapon, updateCombatSystem } from './combat.js';
+import { PLAYER_CONFIG, WEAPON_SPECS } from './config.js';
+import { createMissionSystem } from './missions.js';
+import { createPedestrianPool, updatePedestrians } from './pedestrians.js';
+import { createWantedSystem, updatePolicePursuit } from './police.js';
+import { loadGameProgress, saveGameProgress } from './save.js';
+import { updateTrafficAi } from './traffic.js';
+import {
+  createVehiclePool,
+  exitCurrentVehicle,
+  resprayAndRepairVehicle,
+  tryEnterOrStealVehicle,
+  updateVehiclePhysics,
+} from './vehicles.js';
 
 export const EVENT_HIT = 1;
-export const EVENT_COIN = 2;
 export const EVENT_OVER = 4;
 
-function overlaps(a, b) {
-  return a.x < b.x + b.width && a.x + a.width > b.x && a.y < b.y + b.height && a.y + a.height > b.y;
-}
-
 export function createWorld(random) {
-  const player = { x: 0, y: FIELD.groundY - PLAYER.height, width: PLAYER.width, height: PLAYER.height, invulnerable: 0 };
-  const items = [];
-  for (let index = 0; index < POOL_SIZE; index += 1) {
-    items.push({ active: false, kind: KIND_BLOCK, x: 0, y: 0, width: 0, height: 0, speed: 0 });
-  }
-  const state = { player, items, score: 0, lives: LIVES, level: 1, elapsed: 0, blockTimer: 0, coinTimer: 0 };
+  const city = createCityMap(random);
+  const camera = createCamera3D();
+  const audio = createAudioEngine();
+  const police = createWantedSystem();
+  const combat = createCombatSystem();
+  const missions = createMissionSystem(city);
 
-  function reset() {
-    player.x = (FIELD.width - player.width) / 2;
+  const player = {
+    x: 1865,
+    y: 935,
+    vx: 0,
+    vy: 0,
+    angle: 0,
+    health: PLAYER_CONFIG.maxHealth,
+    armor: 80,
+    cash: PLAYER_CONFIG.startingCash,
+    respect: 250,
+    invulnerable: 0,
+    weaponIndex: 2, // Solana Micro-SMG equipped by default
+    ammo: {
+      fists: 0,
+      vega_pistol: 120,
+      solana_smg: 240,
+      cayo_shotgun: 64,
+      solaris_rifle: 180,
+    },
+    fireTimer: 0,
+    muzzleFlash: 0,
+    walkPhase: 0,
+    vehicle: null,
+  };
+
+  let vehicles = createVehiclePool(random, city);
+  let pedestrians = createPedestrianPool(random, city);
+
+  const state = {
+    city,
+    camera,
+    audio,
+    police,
+    combat,
+    missions,
+    player,
+    vehicles,
+    pedestrians,
+    elapsed: 0,
+    score: PLAYER_CONFIG.startingCash,
+    lives: 3,
+  };
+
+  function reset(useSavedProgress = true) {
+    vehicles = createVehiclePool(random, city);
+    pedestrians = createPedestrianPool(random, city);
+    state.vehicles = vehicles;
+    state.pedestrians = pedestrians;
+    combat.projectiles.length = 0;
+    combat.particles.length = 0;
+    combat.skids.length = 0;
+    combat.popups.length = 0;
+
+    const saved = useSavedProgress ? loadGameProgress() : null;
+    player.x = saved ? saved.x : 1865;
+    player.y = saved ? saved.y : 935;
+    player.angle = 0;
+    player.health = PLAYER_CONFIG.maxHealth;
+    player.armor = saved ? saved.armor : 80;
+    player.cash = saved ? saved.cash : PLAYER_CONFIG.startingCash;
+    player.respect = saved ? saved.respect : 250;
     player.invulnerable = 0;
-    for (const item of items) item.active = false;
-    state.score = 0;
-    state.lives = LIVES;
-    state.level = 1;
-    state.elapsed = 0;
-    state.blockTimer = BLOCK.interval;
-    state.coinTimer = COIN.interval;
+    player.weaponIndex = 2;
+    player.ammo.vega_pistol = 120;
+    player.ammo.solana_smg = 240;
+    player.ammo.cayo_shotgun = 64;
+    player.ammo.solaris_rifle = 180;
+    player.vehicle = null;
+
+    police.clearWanted();
+    if (saved) missions.state.currentIndex = saved.missionIndex % 5;
+    missions.setupMissionIntro(player);
+    updateCameraFollow(camera, player, null, 0.016, true);
   }
 
-  function freeItem() {
-    for (let index = 0; index < items.length; index += 1) if (!items[index].active) return items[index];
-    return null;
+  function handleInteract() {
+    audio.ensureContext();
+    // Check if inside Chrome Customs Garage zone while driving
+    const garage = findLandmarkByKind(city, 'garage');
+    if (player.vehicle && garage && Math.hypot(player.x - garage.x, player.y - garage.y) < 110) {
+      if (resprayAndRepairVehicle(player.vehicle, player, police, combat, audio)) return;
+    }
+
+    // Check if near Miramar Safehouse to save & heal
+    const safehouse = findLandmarkByKind(city, 'safehouse');
+    if (safehouse && Math.hypot(player.x - safehouse.x, player.y - safehouse.y) < 95) {
+      player.health = PLAYER_CONFIG.maxHealth;
+      player.armor = PLAYER_CONFIG.maxArmor;
+      saveGameProgress(state);
+      combat.spawnFloatingText(player.x, player.y, 26, 'MIRAMAR SAFEHOUSE // SAVED & RESTORED!', '#22c55e');
+      audio.playSfx('mission');
+      return;
+    }
+
+    if (player.vehicle) {
+      exitCurrentVehicle(player, audio);
+    } else {
+      tryEnterOrStealVehicle(player, vehicles, police, combat, audio);
+    }
   }
 
-  function spawnBlock() {
-    const item = freeItem();
-    if (item === null) return;
-    item.active = true;
-    item.kind = KIND_BLOCK;
-    item.width = BLOCK.minWidth + random() * (BLOCK.maxWidth - BLOCK.minWidth);
-    item.height = BLOCK.height;
-    item.x = random() * (FIELD.width - item.width);
-    item.y = -item.height;
-    item.speed = BLOCK.speed + BLOCK.speedPerLevel * (state.level - 1) + random() * BLOCK.speedJitter;
+  function cycleWeapon(slot = 0) {
+    if (slot >= 1 && slot <= WEAPON_SPECS.length) {
+      player.weaponIndex = slot - 1;
+    } else {
+      player.weaponIndex = (player.weaponIndex + 1) % WEAPON_SPECS.length;
+    }
   }
 
-  function spawnCoin() {
-    const item = freeItem();
-    if (item === null) return;
-    item.active = true;
-    item.kind = KIND_COIN;
-    item.width = COIN.size;
-    item.height = COIN.size;
-    item.x = random() * (FIELD.width - item.width);
-    item.y = -item.height;
-    item.speed = COIN.speed + COIN.speedPerLevel * (state.level - 1);
+  function quickSave() {
+    saveGameProgress(state);
+    combat.spawnFloatingText(player.x, player.y, 26, 'SAFEHOUSE PROGRESS SAVED!', '#22c55e');
+    audio.playSfx('pickup');
   }
 
-  function blockInterval() {
-    return Math.max(BLOCK.minInterval, BLOCK.interval * BLOCK.intervalScale ** (state.level - 1));
-  }
-
-  /**
-   * One fixed step. `direction` is -1, 0 or 1 (left, still, right). With `harmless` set (the title
-   * screen's backdrop) things fall but nothing touches the player and nothing scores.
-   */
-  function step(dt, direction, harmless) {
+  function step(dt, controls = null, harmless = false) {
     let events = 0;
     state.elapsed += dt;
-    state.level = Math.min(LEVEL.max, 1 + Math.floor(state.elapsed / LEVEL.seconds));
 
-    player.x = Math.min(FIELD.width - player.width, Math.max(0, player.x + direction * PLAYER.speed * dt));
     if (player.invulnerable > 0) player.invulnerable = Math.max(0, player.invulnerable - dt);
+    if (player.fireTimer > 0) player.fireTimer = Math.max(0, player.fireTimer - dt);
+    if (player.muzzleFlash > 0) player.muzzleFlash = Math.max(0, player.muzzleFlash - dt);
 
-    state.blockTimer -= dt;
-    if (state.blockTimer <= 0) {
-      spawnBlock();
-      state.blockTimer += blockInterval();
-    }
-    state.coinTimer -= dt;
-    if (state.coinTimer <= 0) {
-      spawnCoin();
-      state.coinTimer += COIN.interval + random() * COIN.intervalJitter;
+    if (controls && controls.weaponSlot) {
+      cycleWeapon(controls.weaponSlot);
     }
 
-    for (let index = 0; index < items.length; index += 1) {
-      const item = items[index];
-      if (!item.active) continue;
-      item.y += item.speed * dt;
-      if (item.y > FIELD.groundY) {
-        item.active = false;
-        if (item.kind === KIND_BLOCK && !harmless) state.score += BLOCK.dodgePoints;
-        continue;
+    if (player.vehicle) {
+      if (player.vehicle.destroyed) {
+        exitCurrentVehicle(player, audio);
+        player.health = Math.max(15, player.health - 35);
+      } else {
+        updateVehiclePhysics(player.vehicle, controls, city, combat, dt);
+        player.x = player.vehicle.x;
+        player.y = player.vehicle.y;
+        player.angle = player.vehicle.angle;
       }
-      if (harmless || !overlaps(item, player)) continue;
-      if (item.kind === KIND_COIN) {
-        item.active = false;
-        state.score += COIN.points;
-        events |= EVENT_COIN;
-      } else if (player.invulnerable === 0) {
-        item.active = false;
-        state.lives -= 1;
-        player.invulnerable = PLAYER.invulnerable;
-        events |= EVENT_HIT;
-        if (state.lives === 0) {
-          events |= EVENT_OVER;
-          break;
-        }
+    } else if (controls && !harmless) {
+      // On-foot movement in camera-relative or world axes
+      const moveX = controls.moveX || 0;
+      const moveY = controls.moveY || 0;
+      const forwardX = Math.cos(camera.yaw);
+      const forwardY = Math.sin(camera.yaw);
+      const rightX = -forwardY;
+      const rightY = forwardX;
+
+      const dirX = forwardX * moveY + rightX * moveX;
+      const dirY = forwardY * moveY + rightY * moveX;
+      const len = Math.hypot(dirX, dirY);
+      const spd = controls.sprint ? PLAYER_CONFIG.sprintSpeed : PLAYER_CONFIG.walkSpeed;
+
+      if (len > 0.05) {
+        player.vx = (dirX / len) * spd;
+        player.vy = (dirY / len) * spd;
+        player.x += player.vx * dt;
+        player.y += player.vy * dt;
+        player.angle = Math.atan2(player.vy, player.vx);
+        player.walkPhase += dt * (spd * 0.14);
+        const col = collideWorldBuildings(city, player.x, player.y, PLAYER_CONFIG.radius);
+        player.x = col.x;
+        player.y = col.y;
+      } else {
+        player.vx = 0;
+        player.vy = 0;
+      }
+
+      if (controls.firing) {
+        const aimWorld = screenToWorldGround(camera, controls.pointerX, controls.pointerY);
+        fireEquippedWeapon(combat, player, aimWorld.x, aimWorld.y, pedestrians, police, audio);
       }
     }
+
+    updateTrafficAi(vehicles, player, city, combat, random, dt);
+    updatePedestrians(pedestrians, player, vehicles, police, combat, city, audio, random, dt);
+    updatePolicePursuit(police, vehicles, pedestrians, player, combat, city, audio, dt);
+    updateCombatSystem(combat, player, vehicles, pedestrians, police, city, camera, audio, dt);
+    missions.update(state, dt);
+    updateCameraFollow(camera, player, player.vehicle, dt, false);
+    audio.update(player, police, dt);
+
+    state.score = Math.floor(player.cash + player.respect * 25);
+
+    if (!harmless && player.health <= 0) {
+      events |= EVENT_OVER;
+    }
+
     return events;
   }
 
-  reset();
-  return { state, reset, step };
+  reset(false);
+  return {
+    state,
+    reset,
+    step,
+    handleInteract,
+    cycleWeapon,
+    quickSave,
+  };
 }
